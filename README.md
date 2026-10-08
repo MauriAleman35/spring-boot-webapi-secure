@@ -56,3 +56,9 @@ semgrep scan --config auto --config .semgrep.yml src/main/java
 El docente dispone de `docs/GUIA-DOCENTE.md`, que contiene el catálogo de
 hallazgos y las pruebas sugeridas. Se recomienda entregar inicialmente a los
 estudiantes el resto del repositorio sin dicho documento.
+
+## DevSecOps Pipeline
+- SAST con Semgrep y SpotBugs
+- SCA con OWASP Dependency-Check y CycloneDX SBOM
+- Quality Gate activo para bloquear vulnerabilidades criticas
+
