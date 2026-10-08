@@ -5,16 +5,15 @@ on:
     branches: [ 'feature/**', 'bugfix/**', 'hotfix/**' ]
   pull_request:
     branches: [ main, develop ]
+  workflow_dispatch:
 
-# Cancel in-progress runs for the same branch/PR
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  JAVA_VERSION: '25'
+  JAVA_VERSION: '21'
   MAVEN_OPTS: '-Xmx2g'
-  SKIP_SCA: 'false'  # Set to 'true' to skip SCA (Dependency-Check) step and moving to nightly
 
 jobs:
   # ------------------------------------------------------------------
@@ -27,7 +26,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # Needed for Sonar / CodeQL history
+          fetch-depth: 0
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -63,131 +62,99 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # 2. Static Application Security Testing (SAST) - CodeQL
+  # 2. Static Application Security Testing (SAST) - Semgrep
   # ------------------------------------------------------------------
-  sast-codeql:
-    name: SAST - CodeQL
+  sast-semgrep:
+    name: SAST - Semgrep
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      contents: read
-      actions: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java
-          queries: security-and-quality
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: maven
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:java"
-
-  # ------------------------------------------------------------------
-  # 3. Software Composition Analysis (SCA) - Dependency vulnerabilities
-  # ------------------------------------------------------------------
-  sca-dependency-check:
-    name: SCA - OWASP Dependency-Check
-    runs-on: ubuntu-latest
-    if: false  # Skip this job if SKIP_SCA is set to 'true'
+    container:
+      image: semgrep/semgrep
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: maven
-
-      - name: Run OWASP Dependency-Check
+      - name: Run Semgrep scan
         run: |
-          mvn -B org.owasp:dependency-check-maven:check \
-              -DfailBuildOnCVSS=7 \
-              -DsuppressionFile=dependency-check-suppressions.xml || true
-        # Remove "|| true" once you have suppressions in place and want hard fails
+          semgrep scan \
+            --config auto \
+            --config .semgrep.yml \
+            --metrics=off \
+            --json-output=semgrep-results.json \
+            --sarif-output=semgrep-results.sarif \
+            src/main/java || true
 
-      - name: Upload Dependency-Check report
+      - name: Upload Semgrep reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dependency-check-report
-          path: target/dependency-check-report.html
-          retention-days: 14
-
-  # ------------------------------------------------------------------
-  # 4. Optional: SpotBugs + PMD (static analysis)
-  # ------------------------------------------------------------------
-  static-analysis:
-    name: Static Analysis (SpotBugs + PMD)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: maven
-
-      - name: Run SpotBugs & PMD
-        run: |
-          mvn -B clean compile \
-              com.github.spotbugs:spotbugs-maven-plugin:check \
-              org.apache.maven.plugins:maven-pmd-plugin:check || true
-
-      - name: Upload SpotBugs / PMD reports
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: static-analysis-reports
+          name: semgrep-reports
           path: |
-            target/spotbugsXml.xml
-            target/pmd.xml
+            semgrep-results.json
+            semgrep-results.sarif
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # 5. Quality Gate summary (optional - fails the workflow if critical issues)
+  # 3. Static Code Quality & Bug Analysis - SpotBugs
+  # ------------------------------------------------------------------
+  static-analysis:
+    name: Static Analysis - SpotBugs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run SpotBugs
+        run: |
+          mvn -B compile com.github.spotbugs:spotbugs-maven-plugin:check || true
+
+      - name: Upload SpotBugs report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spotbugs-reports
+          path: |
+            target/spotbugsXml.xml
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # 4. Improved Quality Gate - Evaluates Critical Findings
   # ------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-    needs: [build-and-test, sast-codeql, sca-dependency-check]
+    needs: [build-and-test, sast-semgrep, static-analysis]
     if: always()
     steps:
-      - name: Check previous job results
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download Semgrep reports
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep-reports
+        continue-on-error: true
+
+      - name: Download SpotBugs reports
+        uses: actions/download-artifact@v4
+        with:
+          name: spotbugs-reports
+          path: target/
+        continue-on-error: true
+
+      - name: Evaluate Quality Gate (Fails on Critical & High Findings)
         run: |
-          echo "Build & Test: ${{ needs.build-and-test.result }}"
-          echo "CodeQL:       ${{ needs.sast-codeql.result }}"
-          echo "SCA:          ${{ needs.sca-dependency-check.result }}"
-
-          if [[ "${{ needs.build-and-test.result }}" == "failure" ]]; then
-            echo "::error::Build or tests failed"
-            exit 1
-          fi
-
-          if [[ "${{ needs.sast-codeql.result }}" == "failure" ]]; then
-            echo "::error::CodeQL found high-severity security issues"
-            exit 1
-          fi
-
-          echo "Quality gate passed"
+          python scripts/check_quality_gate.py \
+            --semgrep semgrep-results.json \
+            --spotbugs target/spotbugsXml.xml

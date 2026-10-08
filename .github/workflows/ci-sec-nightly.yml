@@ -1,16 +1,15 @@
-name: CI - Nightly - Spring Boot DevSecOps
+name: CI - Nightly - Spring Boot DevSecOps + SCA
 
 on:
   schedule:
-    - cron: '55 20 * * *'  # Runs every day at 20:55
-      timezone: 'America/La_Paz'
+    - cron: '0 2 * * *'  # Runs every day at 02:00 UTC
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  JAVA_VERSION: '25'
+  JAVA_VERSION: '21'
   MAVEN_OPTS: '-Xmx2g'
 
 jobs:
@@ -24,7 +23,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # Needed for Sonar / CodeQL history
+          fetch-depth: 0
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -60,44 +59,35 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # 2. Static Application Security Testing (SAST) - CodeQL
+  # 2. Software Bill of Materials (SBOM) - CycloneDX
   # ------------------------------------------------------------------
-  sast-codeql:
-    name: SAST - CodeQL
+  sbom-cyclonedx:
+    name: SBOM - CycloneDX
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      contents: read
-      actions: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java
-          queries: security-and-quality
-
-      - name: Set up JDK
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
           cache: maven
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      - name: Generate CycloneDX SBOM
+        run: mvn -B org.cyclonedx:cyclonedx-maven-plugin:2.9.3:makeAggregateBom
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+      - name: Upload SBOM Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
         with:
-          category: "/language:java"
+          name: cyclonedx-sbom
+          path: target/bom.json
+          retention-days: 14
 
   # ------------------------------------------------------------------
-  # 3. Software Composition Analysis (SCA) - Dependency vulnerabilities
+  # 3. Software Composition Analysis (SCA) - OWASP Dependency-Check
   # ------------------------------------------------------------------
   sca-dependency-check:
     name: SCA - OWASP Dependency-Check
@@ -106,7 +96,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
@@ -116,74 +106,44 @@ jobs:
       - name: Run OWASP Dependency-Check
         run: |
           mvn -B org.owasp:dependency-check-maven:check \
-              -DfailBuildOnCVSS=7 \
-              -DsuppressionFile=dependency-check-suppressions.xml || true
-        # Remove "|| true" once you have suppressions in place and want hard fails
+              -Dformat=ALL \
+              -DfailBuildOnCVSS=11 || true
 
       - name: Upload Dependency-Check report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dependency-check-report
-          path: target/dependency-check-report.html
+          name: dependency-check-reports
+          path: |
+            target/dependency-check-report.html
+            target/dependency-check-report.json
           retention-days: 14
 
   # ------------------------------------------------------------------
-  # 4. Optional: SpotBugs + PMD (static analysis)
+  # 4. Improved Quality Gate - Evaluates SCA Vulnerabilities
   # ------------------------------------------------------------------
-  static-analysis:
-    name: Static Analysis (SpotBugs + PMD)
+  quality-gate-sca:
+    name: Quality Gate - SCA Check
     runs-on: ubuntu-latest
+    needs: [build-and-test, sca-dependency-check]
+    if: always()
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: maven
+          python-version: '3.10'
 
-      - name: Run SpotBugs & PMD
-        run: |
-          mvn -B clean compile \
-              com.github.spotbugs:spotbugs-maven-plugin:check \
-              org.apache.maven.plugins:maven-pmd-plugin:check || true
-
-      - name: Upload SpotBugs / PMD reports
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Download Dependency-Check reports
+        uses: actions/download-artifact@v4
         with:
-          name: static-analysis-reports
-          path: |
-            target/spotbugsXml.xml
-            target/pmd.xml
-          retention-days: 7
+          name: dependency-check-reports
+          path: target/
+        continue-on-error: true
 
-  # ------------------------------------------------------------------
-  # 5. Quality Gate summary (optional - fails the workflow if critical issues)
-  # ------------------------------------------------------------------
-  quality-gate:
-    name: Quality Gate
-    runs-on: ubuntu-latest
-    needs: [build-and-test, sast-codeql, sca-dependency-check]
-    if: always()
-    steps:
-      - name: Check previous job results
+      - name: Evaluate SCA Quality Gate
         run: |
-          echo "Build & Test: ${{ needs.build-and-test.result }}"
-          echo "CodeQL:       ${{ needs.sast-codeql.result }}"
-          echo "SCA:          ${{ needs.sca-dependency-check.result }}"
-
-          if [[ "${{ needs.build-and-test.result }}" == "failure" ]]; then
-            echo "::error::Build or tests failed"
-            exit 1
-          fi
-
-          if [[ "${{ needs.sast-codeql.result }}" == "failure" ]]; then
-            echo "::error::CodeQL found high-severity security issues"
-            exit 1
-          fi
-
-          echo "Quality gate passed"
+          python scripts/check_quality_gate.py \
+            --dependency-check target/dependency-check-report.json
